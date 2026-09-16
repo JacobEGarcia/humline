@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HUMLINE - hum to stay in the air</title>
+<style>
+:root{--paper:#f4f1ea;--ink:#1d1a16;--soft:#8a8577;--hair:#d8d2c4;--accent:#2536b8}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--paper);color:var(--ink);font-family:ui-sans-serif,system-ui,"Helvetica Neue",Arial,sans-serif;padding:0 20px 60px}
+.wrap{max-width:760px;margin:0 auto}
+.eyebrow{font-size:11px;letter-spacing:.32em;text-transform:uppercase;color:var(--soft);padding:28px 0 10px;border-bottom:1px solid var(--hair)}
+h1{font-size:44px;font-weight:650;letter-spacing:-.01em;margin:26px 0 6px}
+.lede{font-size:16px;color:#3c382f;max-width:56ch}
+.lede em{font-family:Georgia,serif;font-style:italic}
+.stage{border:1px solid var(--hair);border-radius:3px;padding:22px;background:#faf8f2;margin-top:26px}
+canvas{display:block;width:100%;border:1px solid var(--hair);border-radius:3px;background:var(--paper)}
+.controls{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;align-items:center}
+button{font:inherit;cursor:pointer;border:1px solid var(--ink);background:transparent;color:var(--ink);padding:11px 22px;border-radius:3px;letter-spacing:.14em;text-transform:uppercase;font-size:12px;font-weight:600}
+button:hover{background:var(--ink);color:var(--paper)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.ghost{border-color:var(--hair);color:var(--soft)}
+button.ghost:hover{border-color:var(--ink);color:var(--ink);background:transparent}
+.status{font-size:13px;color:var(--soft);margin-top:12px;min-height:1.4em}
+.note{font-size:12px;color:var(--soft);margin-top:30px;border-top:1px solid var(--hair);padding-top:14px;max-width:60ch}
+.hud{display:flex;gap:26px;font-size:12px;color:var(--soft);letter-spacing:.06em;margin-top:12px}
+.hud b{color:var(--ink)}
+@media (max-width:520px){h1{font-size:34px}.stage{padding:14px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">Humsuite &middot; 02 &middot; Voice as control</div>
+  <h1>HUMLINE</h1>
+  <p class="lede">Your voice is the line. Hum higher to climb, lower to sink, and thread the gates. Stop humming and you fall. <em>How far can one breath take you?</em></p>
+
+  <div class="stage">
+    <canvas id="game"></canvas>
+    <div class="hud"><span>DISTANCE <b id="dist">0 m</b></span><span>BEST <b id="best">0 m</b></span><span>NOTE <b id="note">--</b></span></div>
+    <div class="controls">
+      <button id="startBtn" class="primary">Start</button>
+      <button id="demoBtn" class="ghost">Watch a demo run</button>
+    </div>
+    <div class="status" id="status">Allow the microphone. Hum a comfortable middle note to hold altitude.</div>
+  </div>
+
+  <p class="note">Pitch is tracked on your device and never uploaded. Gates drift with your range: after ten seconds the game learns where your voice lives and builds the course around it. Inspired by the hum-driven music tools from The Fixed Seed Company.</p>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const NOTE_NAMES=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const midiName=m=>NOTE_NAMES[((m%12)+12)%12]+(Math.floor(m/12)-1);
+function yinPitch(buf,sr){
+  const half=buf.length>>1;const diff=new Float32Array(half);
+  for(let tau=0;tau<half;tau++){let s=0;for(let i=0;i<half;i++){const d=buf[i]-buf[i+tau];s+=d*d;}diff[tau]=s;}
+  const cmnd=new Float32Array(half);cmnd[0]=1;let run=0;
+  for(let tau=1;tau<half;tau++){run+=diff[tau];cmnd[tau]=run?diff[tau]*tau/run:1;}
+  const th=0.15;let tau=2;
+  while(tau<half-1){if(cmnd[tau]<th){while(tau+1<half-1&&cmnd[tau+1]<cmnd[tau])tau++;break;}tau++;}
+  if(tau>=half-1)return-1;
+  const x0=tau>1?tau-1:tau,x2=tau+1;const s0=cmnd[x0],s1=cmnd[tau],s2=cmnd[x2];
+  const a=(s0+s2-2*s1)/2,b=(s2-s0)/2;const bt=a?tau-b/(2*a):tau;
+  const f=sr/bt;if(f<60||f>1100)return-1;return f;
+}
+function rms(buf){let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];return Math.sqrt(s/buf.length);}
+
+const cv=$("game"),ctx=cv.getContext("2d");
+function size(){const dpr=window.devicePixelRatio||1;const w=cv.clientWidth;cv.width=w*dpr;cv.height=Math.max(300,Math.min(420,w*0.55))*dpr;cv.style.height=(cv.height/dpr)+"px";ctx.setTransform(dpr,0,0,dpr,0,0);cv._w=w;cv._h=cv.height/dpr;}
+window.addEventListener("resize",()=>{size();draw(0);});
+
+let actx,analyser,stream,running=false,demo=false;
+const buf=new Float32Array(4096);
+let plane, gates, dist, speed, best=+(localStorage.getItem("humline_best")||0), rangeLo, rangeHi, voHist=[], dead=0, lastTime=0, raf;
+$("best").textContent=best+" m";
+
+function reset(){
+  size();
+  plane={x:cv._w*0.22,y:cv._h*0.5,vy:0};
+  gates=[];dist=0;speed=2.1;dead=0;voHist=[];
+  rangeLo=null;rangeHi=null;
+  for(let i=0;i<5;i++)spawnGate(cv._w+i*260);
+}
+function spawnGate(x){
+  // gate = gap in an ink wall
+  const gapY=cv._h*(0.25+Math.random()*0.5);
+  const gapH=Math.max(70,cv._h*0.26);
+  gates.push({x,gapY,gapH,passed:false});
+}
+function voiceRangeUpdate(m){
+  voHist.push(m);if(voHist.length>600)voHist.shift();
+  if(voHist.length>120){
+    const s=[...voHist].sort((a,b)=>a-b);
+    rangeLo=s[Math.floor(s.length*0.05)]-1.5;
+    rangeHi=s[Math.floor(s.length*0.95)]+1.5;
+  }
+}
+function midiToY(m){
+  const lo=rangeLo??52,hi=rangeHi??72; // default E3..C5
+  const t=clamp((m-lo)/(hi-lo),0,1);
+  return cv._h*(0.92-t*0.84);
+}
+function currentPitch(){
+  if(demo){
+    // synthetic pilot: sine wander
+    const t=performance.now()/1000;
+    return {f:220*Math.pow(2,(Math.sin(t*0.9)+Math.sin(t*0.37+1))*3/12), demo:true};
+  }
+  analyser.getFloatTimeDomainData(buf);
+  const level=rms(buf);
+  return {f:level>0.008?yinPitch(buf,actx.sampleRate):-1};
+}
+function step(){
+  const now=performance.now();
+  const dt=Math.min(0.05,(now-lastTime)/1000);lastTime=now;
+  const p=currentPitch();
+  if(p.f>0){
+    const m=69+12*Math.log2(p.f/440);
+    voiceRangeUpdate(m);
+    const ty=midiToY(m);
+    plane.vy+=(ty-plane.y)*8*dt;
+    plane.vy*=0.86;
+    $("note").textContent=midiName(Math.round(m));
+  }else{
+    plane.vy+=900*dt; // gravity: silence falls
+    plane.vy=Math.min(plane.vy,420);
+    $("note").textContent="--";
+  }
+  plane.y+=plane.vy*dt;
+  dist+=speed*dt*10;
+  speed+=dt*0.02;
+  for(const g of gates)g.x-=speed*60*dt;
+  if(gates[0].x<-40){gates.shift();spawnGate(gates[gates.length-1].x+260);}
+  // collisions
+  let crashed=false;
+  if(plane.y<6||plane.y>cv._h-6)crashed=true;
+  for(const g of gates){
+    if(Math.abs(g.x-plane.x)<14){
+      if(plane.y<g.gapY-g.gapH/2||plane.y>g.gapY+g.gapH/2)crashed=true;
+      else if(!g.passed){g.passed=true;}
+    }
+  }
+  if(crashed){endRun();return;}
+  draw(p.f>0?midiToY(69+12*Math.log2(p.f/440)):null);
+  $("dist").textContent=Math.round(dist)+" m";
+  raf=requestAnimationFrame(step);
+}
+function draw(targetY){
+  const W=cv._w,H=cv._h;
+  ctx.clearRect(0,0,W,H);
+  if(!running){
+    ctx.fillStyle="#8a8577";ctx.font="12px ui-sans-serif,system-ui";ctx.textAlign="center";
+    ctx.fillText("press start, then hum",W/2,H/2-14);
+    ctx.textAlign="left";
+  }
+  // ground hairlines
+  ctx.strokeStyle="#e2dccf";ctx.lineWidth=1;
+  for(let i=1;i<5;i++){ctx.beginPath();ctx.moveTo(0,H*i/5);ctx.lineTo(W,H*i/5);ctx.stroke();}
+  // range band once learned
+  if(rangeLo!=null){
+    ctx.fillStyle="rgba(37,54,184,.05)";
+    ctx.fillRect(0,midiToY(rangeHi),W,midiToY(rangeLo)-midiToY(rangeHi));
+  }
+  // gates
+  for(const g of gates){
+    ctx.fillStyle=g.passed?"#b9b2a2":"#1d1a16";
+    ctx.fillRect(g.x-6,0,12,g.gapY-g.gapH/2);
+    ctx.fillRect(g.x-6,g.gapY+g.gapH/2,12,H-(g.gapY+g.gapH/2));
+    // tick marks at gap edges
+    ctx.fillStyle="#2536b8";
+    ctx.fillRect(g.x-9,g.gapY-g.gapH/2-2,18,2);
+    ctx.fillRect(g.x-9,g.gapY+g.gapH/2,18,2);
+  }
+  // plane: ink dot + trail
+  ctx.strokeStyle="#2536b8";ctx.lineWidth=2;ctx.beginPath();
+  let first=true;
+  for(let i=0;i<trail.length;i++){const p=trail[i];if(first){ctx.moveTo(p[0],p[1]);first=false;}else ctx.lineTo(p[0],p[1]);}
+  ctx.stroke();
+  ctx.fillStyle="#1d1a16";
+  ctx.beginPath();ctx.arc(plane.x,plane.y,5,0,7);ctx.fill();
+  ctx.fillStyle="#2536b8";
+  ctx.beginPath();ctx.arc(plane.x,plane.y,2.2,0,7);ctx.fill();
+}
+let trail=[];
+const origStep=step;
+step=function(){ // wrap to record trail
+  trail.push([plane?plane.x:0,plane?plane.y:0]);
+  if(trail.length>40)trail.shift();
+  origStep();
+};
+function endRun(){
+  running=false;cancelAnimationFrame(raf);
+  const d=Math.round(dist);
+  if(d>best){best=d;localStorage.setItem("humline_best",best);$("best").textContent=best+" m";}
+  $("status").innerHTML="Run ended at <b>"+d+" m</b>. Press start to go again.";
+  $("startBtn").textContent="Start";
+  if(!demo&&stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+}
+async function start(){
+  if(running){endRun();return;}
+  demo=false;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true}});}
+  catch(e){$("status").textContent="Microphone unavailable. Try the demo run.";return;}
+  actx=actx||new (window.AudioContext||window.webkitAudioContext)();
+  if(actx.state==="suspended")await actx.resume();
+  analyser=actx.createAnalyser();analyser.fftSize=4096;
+  actx.createMediaStreamSource(stream).connect(analyser);
+  begin();
+}
+function begin(){
+  reset();trail=[];running=true;lastTime=performance.now();
+  $("startBtn").textContent="Stop";
+  $("status").innerHTML=demo?"Demo run - a synthetic pilot is humming for you.":"<b>Live.</b> Hum higher to climb, lower to sink. Silence falls.";
+  raf=requestAnimationFrame(step);
+}
+$("startBtn").onclick=start;
+$("demoBtn").onclick=()=>{demo=true;begin();};
+size();reset();draw(null);
+if(new URLSearchParams(location.search).get("demo")){$("demoBtn").click();}
+</script>
+</body>
+</html>
